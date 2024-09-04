@@ -1,0 +1,226 @@
+from typing import Dict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from models.ComplexConvolutionalBlock import *
+from models.transunet.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
+from models.transunet.transunet import *
+class DoubleConv(nn.Sequential):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        if mid_channels is None:
+            mid_channels = out_channels
+        super(DoubleConv, self).__init__(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+
+class Down(nn.Sequential):
+    def __init__(self, in_channels, out_channels):
+        super(Down, self).__init__(
+            nn.MaxPool2d(2, stride=2),
+            DoubleConv(in_channels, out_channels)
+        )
+class Down_2(nn.Sequential):
+    def __init__(self, in_channels, out_channels):
+        super(Down_2, self).__init__(
+            nn.MaxPool2d(2, stride=2),
+            ComplexConvolutionalBlock(in_channels, out_channels)
+        )
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super(Up, self).__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        x1 = self.up(x1)
+        # [N, C, H, W]
+        diff_y = x2.size()[2] - x1.size()[2]
+        diff_x = x2.size()[3] - x1.size()[3]
+
+        # padding_left, padding_right, padding_top, padding_bottom
+        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
+                        diff_y // 2, diff_y - diff_y // 2])
+
+        x = torch.cat([x2, x1], dim=1)
+        x = self.conv(x)
+        return x
+
+class Up_2(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super(Up_2, self).__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = ComplexConvolutionalBlock(in_channels, out_channels)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = ComplexConvolutionalBlock(in_channels, out_channels)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        x1 = self.up(x1)
+        # [N, C, H, W]
+        diff_y = x2.size()[2] - x1.size()[2]
+        diff_x = x2.size()[3] - x1.size()[3]
+
+        # padding_left, padding_right, padding_top, padding_bottom
+        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
+                        diff_y // 2, diff_y - diff_y // 2])
+
+        x = torch.cat([x2, x1], dim=1)
+        x = self.conv(x)
+        return x
+
+
+class OutConv(nn.Sequential):
+    def __init__(self, in_channels, num_classes):
+        super(OutConv, self).__init__(
+            nn.Conv2d(in_channels, num_classes, kernel_size=1)
+        )
+
+
+class UNet(nn.Module):
+    def __init__(self,
+                 in_channels: int = 1,
+                 num_classes: int = 2,
+                 bilinear: bool = True,
+                 base_c: int = 64,
+                ):
+        super(UNet, self).__init__()
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.bilinear = bilinear
+
+        self.in_conv = ComplexConvolutionalBlock(in_channels, base_c)
+
+        factor = 2 if bilinear else 1
+
+        self.down1 = Down_2(base_c, base_c * 2)
+        self.down2 = Down_2(base_c * 2, base_c * 4)
+        self.down3 = Down_2(base_c * 4, base_c * 8)
+        self.down4 = Down_2(base_c * 8, base_c * 16 // factor)
+        self.up1 = Up(base_c * 16, base_c * 8 // factor, bilinear)
+        self.up2 = Up(base_c * 8, base_c * 4 // factor, bilinear)
+        self.up3 = Up(base_c * 4, base_c * 2 // factor, bilinear)
+        self.up4 = Up(base_c * 2, base_c, bilinear)
+
+        self.out_conv = OutConv(base_c, num_classes)
+
+        self.in_conv2 = DoubleConv(base_c*2, base_c)
+        self.down1_2 = Down(base_c, base_c * 2)
+        self.down2_2 = Down(base_c * 2, base_c * 4)
+        self.down3_2 = Down(base_c * 4, base_c * 8)
+        self.down4_2 = Down(base_c * 8, base_c * 16 // factor)
+        self.up1_2 = Up(base_c * 16, base_c * 8 // factor, bilinear)
+        self.up2_2 = Up(base_c * 8, base_c * 4 // factor, bilinear)
+        self.up3_2 = Up(base_c * 4, base_c * 2 // factor, bilinear)
+        self.up4_2 = Up(base_c * 2, base_c , bilinear)
+        self.out_conv_2 = OutConv(base_c, num_classes)
+
+
+        self.in_conv3 = DoubleConv(base_c * 3, base_c)
+        self.down1_3 = Down(base_c, base_c * 2)
+        self.down2_3 = Down(base_c * 2, base_c * 4)
+        self.down3_3 = Down(base_c * 4, base_c * 8)
+        self.down4_3 = Down(base_c * 8, base_c * 16 // factor)
+        self.up1_3 = Up_2(base_c * 16, base_c * 8 // factor, bilinear)
+        self.up2_3 = Up_2(base_c * 8, base_c * 4 // factor, bilinear)
+        self.up3_3 = Up_2(base_c * 4, base_c * 2 // factor, bilinear)
+        self.up4_3 = Up_2(base_c * 2, base_c, bilinear)
+        self.out_conv_3 = OutConv(base_c, num_classes)
+
+        patch_size = (512, 512)
+        vit_patch_size = (16, 16)
+        config_vit = CONFIGS_ViT_seg['R50-ViT-B_16']
+        config_vit.n_classes = 2
+        config_vit.n_skip = 3
+        config_vit.patches.grid = (
+            int(patch_size[0] / vit_patch_size[0]), int(patch_size[0] / vit_patch_size[0]))
+        self.secmodel1 = VisionTransformer(config_vit, img_size=patch_size, num_classes=2 , in_channel = 64).cuda()
+        self.secmodel2 = VisionTransformer(config_vit, img_size=patch_size, num_classes=2,in_channel = 96).cuda()
+        self.out_conv_2 = (OutConv(config_vit['decoder_channels'][-1], num_classes))
+        self.out_conv_3 = (OutConv(config_vit['decoder_channels'][-1], num_classes))
+
+    # def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    #     x1 = self.in_conv(x)
+    #     x2 = self.down1(x1)
+    #     x3 = self.down2(x2)
+    #     x4 = self.down3(x3)
+    #     x5 = self.down4(x4)
+    #     x6 = self.up1(x5, x4)
+    #     x7 = self.up2(x6, x3)
+    #     x8 = self.up3(x7, x2)
+    #     x9 = self.up4(x8, x1)  #x9:32,512,512
+    #     logits_1 = self.out_conv(x9)
+    #
+    #     x1_2 = self.in_conv2(torch.cat((x1,x9),1))
+    #     x9_2 = self.secmodel1(x1_2)
+    #     logits_2 = self.out_conv_2(x9_2)
+    #     # x1_2 = self.in_conv2(torch.cat((x1, x9), 1))
+    #     # x2_2 = self.down1_2(x1_2)
+    #     # x3_2= self.down2_2(x2_2)
+    #     # x4_2 = self.down3_2(x3_2)
+    #     # x5_2 = self.down4_2(x4_2)
+    #     # x6_2 = self.up1_2(x5_2,x4_2)
+    #     # x7_2 = self.up2_2(x6_2,x3_2)
+    #     # x8_2 = self.up3_2(x7_2,x2_2)
+    #     # x9_2 = self.up4_2(x8_2,x1_2)
+    #     # logits_2 = self.out_conv_2(x9_2)
+    #
+    #     x1_3 = self.in_conv3(torch.cat((x1,x9,x9_2),1))
+    #     x9_3 = self.secmodel2(x1_3)
+    #     logits_3 = self.out_conv_3(x9_3)
+    #
+    #     return logits_1,logits_2,logits_3
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        #改编码器
+        x1 = self.in_conv(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x6 = self.up1(x5, x4)
+        x7 = self.up2(x6, x3)
+        x8 = self.up3(x7, x2)
+        x9 = self.up4(x8, x1)  #x9:32,512,512
+
+
+        logits_1 = self.out_conv(x9)
+
+
+        x1_2 = self.in_conv2(torch.cat((x1,x9),1))
+        #
+        #
+        x2_2 = self.down1_2(x1_2)
+        x3_2= self.down2_2(x2_2)
+        x4_2 = self.down3_2(x3_2)
+        x5_2 = self.down4_2(x4_2)
+
+        x6_2 = self.up1_2(x5_2,x4_2)
+        x7_2 = self.up2_2(x6_2,x3_2)
+        x8_2 = self.up3_2(x7_2,x2_2)
+        x9_2 = self.up4_2(x8_2,x1_2)
+
+        logits_2 = self.out_conv_2(x9_2)
+
+        x1_3 = self.in_conv3(torch.cat((x1,x9,x9_2),1))
+        x2_3 = self.down1_3(x1_3)
+        x3_3 = self.down2_3(x2_3)
+        x4_3 = self.down3_3(x3_3)
+        x5_3 = self.down4_3(x4_3)
+        x6_3 = self.up1_3(x5_3, x4_3)
+        x7_3 = self.up2_3(x6_3, x3_3)
+        x8_3 = self.up3_3(x7_3, x2_3)
+        x9_3 = self.up4_3(x8_3, x1_3)
+        logits_3 = self.out_conv_3(x9_3)
+
+        return logits_1,logits_2,logits_3
